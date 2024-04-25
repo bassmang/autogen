@@ -157,6 +157,7 @@ Based on the team composition, and known and unknown facts, please devise a shor
         # Main loop
         total_turns = 0
         max_turns = 30
+        times_stalled = 0
         while total_turns < max_turns:
 
             # Populate the message histories
@@ -391,6 +392,46 @@ Please output an answer in pure JSON format according to the following schema. T
                     # Retrieve the last three evaluations
                     last_evaluations = [cp["evaluation"] for cp in self._checkpoints[-3:]]
                     if all(e >= last_evaluations[i+1] for i, e in enumerate(last_evaluations[:-1])):
+                    # If we've been stalled multiple times, see if we can just make an educated guess
+                        times_stalled += 1
+                        if times_stalled >= 2:
+                            self._print_thought("Check if we can make an educated guess")
+                            educated_guess_promt = f"""Given the following information
+
+{facts}
+
+Please answer the following question, including necessary reasoning:
+    - Do you have two or more congruent pieces of information that will allow you to make an educated guess for the original request? The educated guess MUST answer the question.
+Please output an answer in pure JSON format according to the following schema. The JSON object must be parsable as-is. DO NOT OUTPUT ANYTHING OTHER THAN JSON, AND DO NOT DEVIATE FROM THIS SCHEMA:
+
+    {{
+        "has_educated_guesses": {{
+            "reason": string,
+            "answer": boolean
+        }}
+    }}
+""".strip()
+                        self.orchestrated_messages.append({"role": "user", "content": educated_guess_promt, "name": sender.name})
+                        response = self.client.create(
+                            messages=self.orchestrated_messages,
+                            cache=self.client_cache,
+                            response_format={"type": "json_object"},
+                        )
+                        self.orchestrated_messages.pop()
+
+                        extracted_response = self.client.extract_text_or_completion_object(response)[0]
+                        data = None
+                        try:
+                            data = json.loads(extracted_response)
+                        except json.decoder.JSONDecodeError as e:
+                            # Something went wrong. Restart this loop.
+                            self._print_thought(str(e))
+                            break
+
+                        self._print_thought(json.dumps(data, indent=4))
+                        if data["has_educated_guesses"]["answer"]:
+                            return True, "TERMINATE"
+
                         # Update facts first
                         self._print_thought("We aren't making progress. Evaluating options.")
                         new_facts_prompt = f"""It's clear we aren't making as much progress as we would like, but we may have learned something new. Please rewrite the following fact sheet, updating it to include anything new we have learned. This is also a good time to update educated guesses (please add or update at least one educated guess or hunch, and explain your reasoning). 
