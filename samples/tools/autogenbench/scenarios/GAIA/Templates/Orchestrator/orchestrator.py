@@ -35,6 +35,7 @@ class Orchestrator(ConversableAgent):
         )
 
         self._agents = agents
+        self._checkpoints = []
 
         self.orchestrated_messages = []
 
@@ -60,6 +61,14 @@ class Orchestrator(ConversableAgent):
                 self.send(message, a, request_reply=False, silent=False)
             else:
                 self.send(message, a, request_reply=False, silent=True)
+
+    def save_checkpoint(self, plan, evaluation, response):
+        checkpoint = {
+            "plan": plan,
+            "evaluation": evaluation,
+            "response": response,
+        }
+        self._checkpoints.append(checkpoint)
 
     def run_chat(
         self,
@@ -193,7 +202,8 @@ To make progress on the request, please answer the following questions, includin
 
     - Is the request fully satisfied? (True if complete, or False if the original request has yet to be SUCCESSFULLY addressed)
     - Are we making forward progress? (True if just starting, or recent messages are adding value. False if recent messages show evidence of being stuck in a reasoning or action loop, or there is evidence of significant barriers to success such as the inability to read from a required file)
-
+    - How would you rate the current evaluation of the request? (1 to 100, with 100 being the best possible evaluation)
+    
 Please output an answer in pure JSON format according to the following schema. The JSON object must be parsable as-is. DO NOT OUTPUT ANYTHING OTHER THAN JSON, AND DO NOT DEVIATE FROM THIS SCHEMA:
 
     {{
@@ -204,6 +214,10 @@ Please output an answer in pure JSON format according to the following schema. T
         "is_progress_being_made": {{
             "reason": string,
             "answer": boolean
+        }},
+        "current_evaluation": {{
+            "reason": string,
+            "answer": int  # Rating from 1 to 100
         }}
     }}
 """.strip()
@@ -246,6 +260,7 @@ To make progress on the request, please answer the following questions, includin
 
     - Is the request fully satisfied? (True if complete, or False if the original request has yet to be SUCCESSFULLY addressed)
     - Are we making forward progress? (True if just starting, or recent messages are adding value. False if recent messages show evidence of being stuck in a reasoning or action loop, or there is evidence of significant barriers to success such as the inability to read from a required file)
+    - How would you rate the current evaluation of the request? (1 to 100, with 100 being the best possible evaluation)
     - Who should speak next? (select from: {names})
     - What instruction or question would you give this team member? (Phrase as if speaking directly to them, and include any specific information they may need)
 
@@ -259,6 +274,10 @@ Please output an answer in pure JSON format according to the following schema. T
         "is_progress_being_made": {{
             "reason": string,
             "answer": boolean
+        }},
+        "current_evaluation": {{
+            "reason": string,
+            "answer": int  # Rating from 1 to 100
         }},
         "next_speaker": {{
             "reason": string,
@@ -287,6 +306,74 @@ Please output an answer in pure JSON format according to the following schema. T
                         self._print_thought(str(e))
                         break
 
+                    # Processing the previous message and evaluation
+                    prev_message = data["instruction_or_question"]["answer"]
+                    prev_evaluation = str(data["current_evaluation"]["answer"])  # Assuming a method to extract current evaluation
+                    self._print_thought("\n\nEvaluating and updating plan based on new data...\n\n")
+
+                    # Formulate new plan prompt
+                    new_plan_prompt = f"""
+                    Based on the most recent feedback and our need for innovation:
+                    - Last Evaluation: {prev_evaluation}
+                    - Last Response: {json.dumps(data, indent=4)}
+
+                    Please revise our existing plan to develop a more effective approach. The goal is to create a unique plan that diverges from previous strategies, ensuring a fresh perspective. The previous plan was:
+                    {plan}
+
+                    To guide your proposal, use bullet points to outline the new plan. Consider the team composition and incorporate insights from the recent evaluation:
+                    Team Membership:
+                    {team}
+                    """.strip()
+
+                    self.orchestrated_messages.append({"role": "user", "content": new_plan_prompt, "name": sender.name})
+                    response = self.client.create(
+                        messages=self.orchestrated_messages,
+                        cache=self.client_cache,
+                    )
+                    new_plan = self.client.extract_text_or_completion_object(response)[0]
+                    self.orchestrated_messages.pop() # Remove new plan prompt
+                    # Prepare a message with the new plan to broadcast to all agents
+                    new_plan_message = {
+                        "role": "user",
+                        "content": f"New Updated Plan: \n{new_plan}",
+                        "name": self.name
+                    }
+
+                    # Broadcast the new plan message to all agents
+                    self._broadcast(new_plan_message)  # Assuming self._agents lists all agents who should hear the update
+
+                    self._print_thought(f"Updated Plan:\n{new_plan}\nDONE UPDATED PLAN")
+
+                    # Rerun now with new plan
+                    self.orchestrated_messages.append({"role": "user", "content": step_prompt, "name": sender.name})
+                    response = self.client.create(
+                        messages=self.orchestrated_messages,
+                        cache=self.client_cache,
+                        response_format={"type": "json_object"},
+                    )
+                    self.orchestrated_messages.pop()
+
+                    extracted_response = self.client.extract_text_or_completion_object(response)[0]
+                    try:
+                        data2 = json.loads(extracted_response)
+                    except json.decoder.JSONDecodeError as e:
+                        # Something went wrong. Restart this loop.
+                        self._print_thought(str(e))
+                        break
+
+                    self._print_thought("INSTRUCTION1: " + str(data["instruction_or_question"]["answer"]) + "\nINSTRUCTION2: " + str(data2["instruction_or_question"]["answer"]) + "\n\n")
+                    self._print_thought("EVAL1: " + str(data["current_evaluation"]["answer"]) + "\nEVAL2: " + str(data2["current_evaluation"]["answer"]) + "\n\n")
+                    
+                    # Maintain the best evaluation
+                    if data2["current_evaluation"]["answer"] > data["current_evaluation"]["answer"]:
+                        data = data2
+                        plan = new_plan
+
+                # Checkpoint Evaluation
+                self.save_checkpoint(plan, data["current_evaluation"]["answer"], data["instruction_or_question"]["answer"])
+
+                self._print_thought("CHECKPOINTS:\n\n" + str(self._checkpoints) + "\n\n" + "DONE CHECKPOINTS")
+
                 self._print_thought(json.dumps(data, indent=4))
 
                 if data["is_request_satisfied"]["answer"]:
@@ -296,36 +383,54 @@ Please output an answer in pure JSON format according to the following schema. T
                     stalled_count -= 1
                     stalled_count = max(stalled_count, 0)
                 else:
+                    self._print_thought("\n\nSTALLED:\n\n")
                     stalled_count += 1
 
-                if stalled_count >= 3: 
-                    self._print_thought("We aren't making progress. Let's reset.")
-                    new_facts_prompt = f"""It's clear we aren't making as much progress as we would like, but we may have learned something new. Please rewrite the following fact sheet, updating it to include anything new we have learned. This is also a good time to update educated guesses (please add or update at least one educated guess or hunch, and explain your reasoning). 
+                # Check if the evaluations are stagnant or decreasing over the last 3 checkpoints
+                if len(self._checkpoints) >= 3:
+                    # Retrieve the last three evaluations
+                    last_evaluations = [cp["evaluation"] for cp in self._checkpoints[-3:]]
+                    if all(e >= last_evaluations[i+1] for i, e in enumerate(last_evaluations[:-1])):
+                        # Update facts first
+                        self._print_thought("We aren't making progress. Evaluating options.")
+                        new_facts_prompt = f"""It's clear we aren't making as much progress as we would like, but we may have learned something new. Please rewrite the following fact sheet, updating it to include anything new we have learned. This is also a good time to update educated guesses (please add or update at least one educated guess or hunch, and explain your reasoning). 
 
 {facts}
 """.strip()
-                    self.orchestrated_messages.append({"role": "user", "content": new_facts_prompt, "name": sender.name})
-                    response = self.client.create(
-                        messages=self.orchestrated_messages,
-                        cache=self.client_cache,
-                    )
-                    facts = self.client.extract_text_or_completion_object(response)[0]
-                    self.orchestrated_messages.append({"role": "assistant", "content": facts, "name": self.name})
+                        self.orchestrated_messages.append({"role": "user", "content": new_facts_prompt, "name": sender.name})
+                        response = self.client.create(
+                            messages=self.orchestrated_messages,
+                            cache=self.client_cache,
+                        )
+                        facts = self.client.extract_text_or_completion_object(response)[0]
+                        self.orchestrated_messages.append({"role": "assistant", "content": facts, "name": self.name})
 
+                        # Update plan next
+                        historical_plans = [cp["plan"] for cp in self._checkpoints]
+                        historical_evaluations = [cp["evaluation"] for cp in self._checkpoints]
+                        historical_responses = [cp["response"] for cp in self._checkpoints]
 
-                    new_plan_prompt = f"""Please come up with a new plan expressed in bullet points. Keep in mind the following team composition, and do not involve any other outside people in the plan -- we cannot contact anyone else.
+                        # Create a new plan prompt reflecting the entire history of checkpoints and specific team considerations
+                        new_plan_prompt = "We have noticed a lack of progress in our last three evaluations. Here's a comprehensive overview of all our efforts:\n"
+                        for i in range(len(historical_plans)):
+                            new_plan_prompt += f"Plan {i+1}: {historical_plans[i]}, Evaluation: {historical_evaluations[i]}, Insights: {historical_responses[i]}\n"
+                        new_plan_prompt += "\nPlease develop a new plan expressed in bullet points, taking into account the following team composition and our entire history. We cannot include any outside individuals in this plan."
+                        new_plan_prompt += f"\n\nTeam membership:\n{team}\n"
+                        self.orchestrated_messages.append({
+                            "role": "user",
+                            "content": new_plan_prompt,
+                            "name": sender.name
+                        })
 
-Team membership:
-{team}
-""".strip()
-                    self.orchestrated_messages.append({"role": "user", "content": new_plan_prompt, "name": sender.name})
-                    response = self.client.create(
-                        messages=self.orchestrated_messages,
-                        cache=self.client_cache,
-                    )
+                        # Send the orchestrated messages to the client for processing
+                        response = self.client.create(
+                            messages=self.orchestrated_messages,
+                            cache=self.client_cache,
+                        )
 
-                    plan = self.client.extract_text_or_completion_object(response)[0]
-                    break
+                        plan = self.client.extract_text_or_completion_object(response)[0]
+                        self._checkpoints = []
+                        break
 
                 # Broadcast the message to all agents
                 m = {"role": "user", "content": data["instruction_or_question"]["answer"], "name": self.name}
